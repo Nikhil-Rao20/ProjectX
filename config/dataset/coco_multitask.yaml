@@ -1,0 +1,26 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# COCO 2017 dataset http://cocodataset.org by Microsoft
+# Example usage: yolo train data=coco.yaml
+# parent
+# ├── ultralytics
+# └── datasets
+#     └── coco  ← downloads here (20.1 GB)
+
+# MS-COCO Person Multi-Task (https://github.com/ultralytics/ultralytics/pull/5219#issuecomment-1781477032)
+
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+## Change path to your images and annotations root folder
+# path: C:/Users/nikhi/Desktop/multi-task-datasets/coco-multi-person  
+path: C:/Users/nikhi/Desktop/Mini-COCO
+# train: train.txt  # train images (relative to 'path') 118287 images
+# val: val.txt  # val images (relative to 'path') 5000 images
+
+train: ./images/train
+val: ./images/val
+# Keypoints
+kpt_shape: [17, 3]  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
+
+# Classes
+names:
+  0: person
