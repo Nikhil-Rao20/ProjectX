@@ -306,7 +306,7 @@ class InceptionNeXt_Conv(nn.Module):
 # Advanced_Attention_Based_Conv_Block (Proposing)
 # --------------------------------------------------------------------------------------------------------
     
-class _Conv(nn.Module):
+class AdvancedAttentionBasedConvBlock(nn.Module):
 
     class DropPath_Simple(nn.Module):
         def __init__(self, drop_prob=None):
