@@ -119,7 +119,7 @@ class v8DetectionLoss:
         """Initializes v8DetectionLoss with the model, defining model-related properties and BCE loss function."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
-
+        self.model = model
         m = model.model[-1]  # Detect() module
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
         self.hyp = h
@@ -527,45 +527,340 @@ class v8ClassificationLoss:
         loss_items = loss.detach()
         return loss, loss_items
 
+from collections import defaultdict
+
+# class MultiTaskLoss(v8DetectionLoss):
+#     scale_mode = 'min'
+#     compute_stats  = False
+#     class ProcrustesSolver:
+#         @staticmethod
+#         def apply(grads, scale_mode='min'):
+#             assert (
+#                 len(grads.shape) == 3
+#             ), f"Invalid shape of 'grads': {grads.shape}. Only 3D tensors are applicable"
+
+#             with torch.no_grad():
+#                 print(grads.shape, grads)
+#                 cov_grad_matrix_e = torch.matmul(grads.permute(0, 2, 1), grads)
+#                 cov_grad_matrix_e = cov_grad_matrix_e.mean(0)
+#                 cov_grad_matrix_e = cov_grad_matrix_e.to(torch.float32)
+#                 print("Shape of input :",cov_grad_matrix_e.shape)
+#                 singulars, basis = torch.linalg.eigh(cov_grad_matrix_e, UPLO='U') #torch.symeig(cov_grad_matrix_e, eigenvectors=True)
+#                 singulars = singulars.to(torch.float16)
+#                 basis = basis.to(torch.float16)
+#                 tol = (
+#                     torch.max(singulars)
+#                     * max(cov_grad_matrix_e.shape[-2:])
+#                     * torch.finfo().eps
+#                 )
+#                 rank = sum(singulars > tol)
+#                 print("TOL and Singular : ",tol, singulars)
+
+#                 order = torch.argsort(singulars, dim=-1, descending=True)
+#                 print("Shapes of outputs 1:",singulars.shape, basis.shape)
+#                 print("rank, order: ", rank, order)
+#                 singulars, basis = singulars[order][:rank], basis[:, order][:, :rank]
+#                 print("Shapes of outputs2 :",singulars.shape, basis.shape)
+
+#                 if scale_mode == 'min':
+#                     weights = basis * torch.sqrt(singulars[-1]).view(1, -1)
+#                 elif scale_mode == 'median':
+#                     weights = basis * torch.sqrt(torch.median(singulars)).view(1, -1)
+#                 elif scale_mode == 'rmse':
+#                     weights = basis * torch.sqrt(singulars.mean())
+
+#                 weights = weights / torch.sqrt(singulars).view(1, -1)
+#                 weights = torch.matmul(weights, basis.T)
+#                 grads = torch.matmul(grads, weights.unsqueeze(0))
+
+#                 return grads, weights, singulars
+
+#     def __init__(self, model):  # model must be de-paralleled
+#         super().__init__(model)
+#         self.pose_loss = v8PoseLoss(model)
+#         self.seg_loss = v8SegmentationLoss(model)
+#         self.loss_map = ['box', 'pose', 'kobj', 'seg', 'cls', 'dfl']
+#         self.log_vars = torch.nn.Parameter(torch.zeros(len(self.loss_map), requires_grad=True))
+#         self.losses = defaultdict(float)
+#     def compute_alignment(self, grads):
+#         """
+#         Align task gradients using Procrustes analysis.
+#         """
+#         grads, weights, _ = MultiTaskLoss.ProcrustesSolver.apply(grads.T.unsqueeze(0), self.scale_mode)
+#         return grads[0].sum(-1), weights.sum(-1)
+    
+#     def get_task_gradients(self, losses, shared_params):
+#         """
+#         Compute task gradients with respect to shared parameters.
+#         """
+#         grads = []
+#         for task_loss in losses:
+#             # print(f"task_loss type: {type(task_loss)}, shape: {task_loss.shape}, value: {task_loss}")
+#             if not isinstance(task_loss, torch.Tensor):
+#                 raise ValueError(f"Each task_loss must be a tensor. Got {type(task_loss)}")
+
+#             task_grads = torch.autograd.grad(
+#                 task_loss, shared_params, retain_graph=True, allow_unused=True
+#             )
+
+#             # Handle potential None values in gradients
+#             grad_vector = torch.cat([
+#                 g.flatten() if g is not None else torch.zeros_like(p).flatten()
+#                 for g, p in zip(task_grads, shared_params)
+#             ])
+
+#             grads.append(grad_vector)
+
+#         return torch.stack(grads, dim=0)
+
+    
+#     def set_shared_grad(self, shared_params, aligned_grad):
+#         """
+#         Update the gradients for shared parameters.
+#         """
+#         offset = 0
+#         for param in shared_params:
+#             if param.grad is not None:
+#                 numel = param.numel()
+#                 param.grad.data = aligned_grad[offset:offset + numel].view_as(param.grad)
+#                 offset += numel
+        
+#     def update_loss_weights(self, val_losses):
+#         """
+#         Update dynamic loss weights based on the validation losses for each task.
+#         """
+#         total_inverse_loss = sum(1/(loss1+1e-6) for loss1 in val_losses)
+#         dynamic_loss_weights = {task: (1 / (loss1 + 1e-6)) / total_inverse_loss for task, loss1 in zip(self.loss_map, val_losses)}
+#         return dynamic_loss_weights
+
+#     def __call__(self, preds, batch):
+#         """Calculate the total loss and detach it."""
+#         # box_loss, pose_loss, kobj_loss, seg_loss, cls_loss, dfl_loss
+#         loss = torch.zeros(6, device=self.device)
+#         feats, pred_kpts, pred_masks, proto = preds if len(preds) == 4 else preds[1]
+#         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
+#         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+#             (self.reg_max * 4, self.nc), 1)
+
+#         # b, grids, ..
+#         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
+#         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+#         pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
+#         pred_masks = pred_masks.permute(0, 2, 1).contiguous()
+
+#         dtype = pred_scores.dtype
+#         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+#         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
+
+#         # targets
+#         batch_idx = batch['batch_idx'].view(-1, 1)
+#         targets = torch.cat((batch_idx, batch['cls'].view(-1, 1), batch['bboxes']), 1)
+#         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+#         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+#         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
+
+#         # pboxes
+#         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
+#         pred_kpts = self.pose_loss.kpts_decode(anchor_points,
+#                                                pred_kpts.view(batch_size, -1,
+#                                                               *self.pose_loss.kpt_shape))  # (b, h*w, 17, 3)
+
+#         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+#             pred_scores.detach().sigmoid(), (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+#             anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt)
+
+#         target_scores_sum = max(target_scores.sum(), 1)
+
+#         # cls loss
+#         loss[4] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+
+#         if fg_mask.any():
+#             target_strided_bboxes = target_bboxes / stride_tensor
+
+#             # bbox regression loss
+#             loss[0], loss[5] = self.bbox_loss(
+#                 pred_distri,
+#                 pred_bboxes,
+#                 anchor_points,
+#                 target_strided_bboxes,
+#                 target_scores,
+#                 target_scores_sum,
+#                 fg_mask,
+#             )
+
+#             # keypoints loss
+#             keypoints = batch['keypoints'].to(self.device).float().clone()
+#             keypoints[..., 0] *= imgsz[1]
+#             keypoints[..., 1] *= imgsz[0]
+#             loss[1], loss[2] = self.pose_loss.calculate_keypoints_loss(
+#                 fg_mask,
+#                 target_gt_idx,
+#                 keypoints,
+#                 batch_idx,
+#                 stride_tensor,
+#                 target_strided_bboxes,
+#                 pred_kpts,
+#             )
+
+#             # segmentation loss
+#             masks = batch['masks'].to(self.device).float()
+#             if tuple(masks.shape[-2:]) != (mask_h, mask_w):  # downsample
+#                 masks = F.interpolate(masks[None], (mask_h, mask_w), mode='nearest')[0]
+
+#             loss[3] = self.seg_loss.calculate_segmentation_loss(fg_mask, masks, target_gt_idx, target_bboxes, batch_idx,
+#                                                                 proto, pred_masks, imgsz, self.seg_loss.overlap)
+
+#         # loss[0] *= self.hyp.box  # box gain
+#         # loss[1] *= self.hyp.pose  # pose gain
+#         # loss[2] *= self.hyp.kobj  # kobj gain
+#         # loss[3] *= self.hyp.box  # seg gain
+#         # loss[4] *= self.hyp.cls  # cls gain
+#         # loss[5] *= self.hyp.dfl  # dfl gain
+#         # print('Params shape :',len(list(self.params)))
+#         grads = self.get_task_gradients(loss, torch.cat([p.view(-1) for p in self.params]))
+#         aligned_grad, weights = self.compute_alignment(grads)
+#         for i in range(len(loss)):
+#             loss[i] *= weights[i]
+#         self.set_shared_grad(list(self.hyp), aligned_grad)
+
+
+#         # dynamic_loss_weights = self.update_loss_weights(loss)    
+#         # loss[0] *= dynamic_loss_weights['box']  # box gain
+#         # loss[1] *= dynamic_loss_weights['pose'] # pose gain
+#         # loss[2] *= dynamic_loss_weights['kobj'] # kobj gain
+#         # loss[3] *= dynamic_loss_weights['seg'] # seg gain
+#         # loss[4] *= dynamic_loss_weights['cls']# cls gain
+#         # loss[5] *= dynamic_loss_weights['dfl']  # dfl gain
+        
+#         return loss.sum() * batch_size, loss.detach()
+
+import torch
+import torch.nn.functional as F
+from collections import defaultdict
+
 
 class MultiTaskLoss(v8DetectionLoss):
+    scale_mode = 'min'
+
+    class ProcrustesSolver:
+        @staticmethod
+        def apply(grads, scale_mode='min'):
+            assert (
+                len(grads.shape) == 3
+            ), f"Invalid shape of 'grads': {grads.shape}. Only 3D tensors are applicable"
+
+            with torch.no_grad():
+                cov_grad_matrix_e = torch.matmul(grads.permute(0, 2, 1), grads)
+                cov_grad_matrix_e = cov_grad_matrix_e.mean(0)
+                cov_grad_matrix_e = cov_grad_matrix_e.to(torch.float32)
+                if torch.any(torch.isnan(cov_grad_matrix_e)) :
+                    raise ValueError("Matrix contains NaN  values")
+                elif torch.any(torch.isinf(cov_grad_matrix_e)):
+                    print("Matrix contains  Inf values")
+                    cov_grad_matrix_e = torch.where(torch.isinf(cov_grad_matrix_e), torch.full_like(cov_grad_matrix_e, 1e6), cov_grad_matrix_e)
+                if torch.norm(cov_grad_matrix_e) > 1e6:
+                    print("Matrix is ill-conditioned with very large values")
+                    cov_grad_matrix_e = cov_grad_matrix_e / torch.norm(cov_grad_matrix_e) * 1e6
+
+                singulars, basis = torch.linalg.eigh(cov_grad_matrix_e, UPLO='U')
+                singulars = singulars.to(torch.float32)
+                basis = basis.to(torch.float32)
+                tol = (
+                    torch.max(singulars)
+                    * max(cov_grad_matrix_e.shape[-2:])
+                    * torch.finfo(singulars.dtype).eps
+                )
+                rank = sum(singulars > tol)
+                
+                if rank==0:
+                     print("Warning: All singular values are zero. Skipping alignment.")
+                     return grads, torch.eye(grads.shape[-1]), singulars, False
+
+                order = torch.argsort(singulars, dim=-1, descending=True)
+                singulars, basis = singulars[order][:rank], basis[:, order][:, :rank]
+                print('Singulars :',singulars.shape, basis.shape)
+                if scale_mode == 'min':
+                    weights = basis * torch.sqrt(singulars[-1]).view(1, -1)
+                elif scale_mode == 'median':
+                    weights = basis * torch.sqrt(torch.median(singulars)).view(1, -1)
+                elif scale_mode == 'rmse':
+                    weights = basis * torch.sqrt(singulars.mean())
+
+                weights = weights / torch.sqrt(singulars).view(1, -1)
+                weights = torch.matmul(weights, basis.T)
+                grads = torch.matmul(grads, weights.unsqueeze(0))
+
+                return grads, weights, singulars, True
 
     def __init__(self, model):  # model must be de-paralleled
         super().__init__(model)
         self.pose_loss = v8PoseLoss(model)
         self.seg_loss = v8SegmentationLoss(model)
+        self.loss_map = ['box', 'pose', 'kobj', 'seg', 'cls', 'dfl']
+        self.log_vars = torch.nn.Parameter(torch.zeros(len(self.loss_map), requires_grad=True))
+        self.losses = defaultdict(float)
+        self.useBalancer = True
+
+    def compute_alignment(self, grads):
+        grads, weights, _, useBalancer= MultiTaskLoss.ProcrustesSolver.apply(grads.T.unsqueeze(0), self.scale_mode)
+        return grads[0].sum(-1), weights.sum(-1), useBalancer
+
+    def get_task_gradients(self, losses, shared_params):
+        grads = []
+        
+        for task_loss in losses:
+            if not isinstance(task_loss, torch.Tensor):
+                raise ValueError(f"Each task_loss must be a tensor. Got {type(task_loss)}")
+            if task_loss.grad_fn is None:
+                task_loss = task_loss.clone().detach().requires_grad_(True)
+            task_grads = torch.autograd.grad(task_loss, shared_params, retain_graph=True, create_graph=True, allow_unused=True)
+
+            grad_vector = torch.cat([
+                g.flatten() if g is not None else torch.zeros_like(p).flatten()
+                for g, p in zip(task_grads, shared_params)
+            ])
+
+            grads.append(grad_vector)
+
+        return torch.stack(grads, dim=0)
+
+    def set_shared_grad(self, shared_params, aligned_grad):
+        offset = 0
+        for param in shared_params:
+            if param.grad is not None:
+                numel = param.numel()
+                param.grad.data = aligned_grad[offset:offset + numel].view_as(param)
+                offset += numel
+
+    def update_loss_weights(self, val_losses):
+        total_inverse_loss = sum(1 / (loss1 + 1e-6) for loss1 in val_losses)
+        dynamic_loss_weights = {task: (1 / (loss1 + 1e-6)) / total_inverse_loss for task, loss1 in zip(self.loss_map, val_losses)}
+        return dynamic_loss_weights
 
     def __call__(self, preds, batch):
-        """Calculate the total loss and detach it."""
-        # box_loss, pose_loss, kobj_loss, seg_loss, cls_loss, dfl_loss
         loss = torch.zeros(6, device=self.device)
         feats, pred_kpts, pred_masks, proto = preds if len(preds) == 4 else preds[1]
-        batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
+        batch_size, _, mask_h, mask_w = proto.shape
         pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
             (self.reg_max * 4, self.nc), 1)
 
-        # b, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
         pred_kpts = pred_kpts.permute(0, 2, 1).contiguous()
         pred_masks = pred_masks.permute(0, 2, 1).contiguous()
 
         dtype = pred_scores.dtype
-        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
-        # targets
         batch_idx = batch['batch_idx'].view(-1, 1)
         targets = torch.cat((batch_idx, batch['cls'].view(-1, 1), batch['bboxes']), 1)
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
-        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
 
-        # pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
-        pred_kpts = self.pose_loss.kpts_decode(anchor_points,
-                                               pred_kpts.view(batch_size, -1,
-                                                              *self.pose_loss.kpt_shape))  # (b, h*w, 17, 3)
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)
+        pred_kpts = self.pose_loss.kpts_decode(anchor_points, pred_kpts.view(batch_size, -1, *self.pose_loss.kpt_shape))
 
         _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
             pred_scores.detach().sigmoid(), (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
@@ -573,50 +868,42 @@ class MultiTaskLoss(v8DetectionLoss):
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # cls loss
-        loss[4] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[4] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         if fg_mask.any():
             target_strided_bboxes = target_bboxes / stride_tensor
-
-            # bbox regression loss
-            loss[0], loss[5] = self.bbox_loss(
-                pred_distri,
-                pred_bboxes,
-                anchor_points,
-                target_strided_bboxes,
-                target_scores,
-                target_scores_sum,
-                fg_mask,
-            )
-
-            # keypoints loss
+            loss[0], loss[5] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points,
+                                              target_strided_bboxes, target_scores, target_scores_sum, fg_mask)
             keypoints = batch['keypoints'].to(self.device).float().clone()
             keypoints[..., 0] *= imgsz[1]
             keypoints[..., 1] *= imgsz[0]
-            loss[1], loss[2] = self.pose_loss.calculate_keypoints_loss(
-                fg_mask,
-                target_gt_idx,
-                keypoints,
-                batch_idx,
-                stride_tensor,
-                target_strided_bboxes,
-                pred_kpts,
-            )
+            loss[1], loss[2] = self.pose_loss.calculate_keypoints_loss(fg_mask, target_gt_idx, keypoints, batch_idx,
+                                                                       stride_tensor, target_strided_bboxes, pred_kpts)
 
-            # segmentation loss
             masks = batch['masks'].to(self.device).float()
-            if tuple(masks.shape[-2:]) != (mask_h, mask_w):  # downsample
+            if tuple(masks.shape[-2:]) != (mask_h, mask_w):
                 masks = F.interpolate(masks[None], (mask_h, mask_w), mode='nearest')[0]
-
             loss[3] = self.seg_loss.calculate_segmentation_loss(fg_mask, masks, target_gt_idx, target_bboxes, batch_idx,
                                                                 proto, pred_masks, imgsz, self.seg_loss.overlap)
-
-        loss[0] *= self.hyp.box  # box gain
-        loss[1] *= self.hyp.pose  # pose gain
-        loss[2] *= self.hyp.kobj  # kobj gain
-        loss[3] *= self.hyp.box  # seg gain
-        loss[4] *= self.hyp.cls  # cls gain
-        loss[5] *= self.hyp.dfl  # dfl gain
+        
+        if self.useBalancer:
+            shared_params = []
+            for param in self.model.parameters():
+                if not param.requires_grad:
+                    param.requires_grad_(True)
+                shared_params.append(param)
+            grads = self.get_task_gradients(loss, shared_params)
+            aligned_grad, weights,useBalancer = self.compute_alignment(grads)
+            if useBalancer:
+                for i in range(len(loss)):
+                    loss[i] *= weights[i]
+                self.set_shared_grad(shared_params, aligned_grad)
+        else:
+            loss[0] *= self.hyp.box  # box gain
+            loss[1] *= self.hyp.pose # pose gain
+            loss[2] *= self.hyp.kob # kobj gain
+            loss[3] *= self.hyp.seg # seg gain
+            loss[4] *= self.hyp.cls# cls gain
+            loss[5] *= self.hyp.dfl  # dfl gain
 
         return loss.sum() * batch_size, loss.detach()

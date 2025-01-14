@@ -5,16 +5,111 @@ import math
 
 import torch
 import torch.nn as nn
+from functools import partial
+from timm.models.layers import DropPath
 from torch.nn.init import constant_, xavier_uniform_
-
 from ultralytics.utils.tal import TORCH_1_10, dist2bbox, make_anchors
-
+import torch.nn.functional as F
 from .block import DFL, Proto
-from .conv import Conv
+from .conv import Conv, EnhancedAttentionResidualBlock
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init_
+from matplotlib import pyplot as plt
+__all__ = 'Attention', 'Detect', 'Segment', 'Pose', 'Classify', 'RTDETRDecoder'
 
-__all__ = 'Detect', 'Segment', 'Pose', 'Classify', 'RTDETRDecoder'
+
+class Attention(nn.Module):
+
+    def __init__(
+            self,
+            dim,
+            num_heads=8,
+            qkv_bias=False,
+            qk_norm=False,
+            attn_drop=0.,
+            proj_drop=0.,
+            norm_layer=nn.LayerNorm,
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = True
+
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        
+        device = x.device
+        self.qkv = self.qkv.to(device)
+        self.q_norm = self.q_norm.to(device)
+        self.k_norm = self.k_norm.to(device)
+        self.proj = self.proj.to(device)
+
+        dtype = self.qkv.weight.dtype
+        x = x.to(dtype)
+
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(
+             q, k, v,
+                dropout_p=self.attn_drop.p,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+    
+
+class GatedCNNBlock(nn.Module):
+    def __init__(self, c1, dim, k=7, expansion_ratio=8/3, conv_ratio=1.0,
+                 norm_layer=partial(nn.LayerNorm,eps=1e-6), 
+                 act_layer=nn.GELU,
+                 drop_path=0.,
+                 **kwargs):
+        super().__init__()
+        self.norm = norm_layer([dim])
+        hidden = int(expansion_ratio * dim)
+        self.fc1 = nn.Linear(dim, hidden * 2)
+        self.act = act_layer()
+        conv_channels = int(conv_ratio * dim)
+        self.split_indices = (hidden, hidden - conv_channels, conv_channels)
+        self.dwconv = nn.Conv2d(c1,dim, kernel_size=k, groups=1)
+        self.conv = nn.Conv2d(conv_channels, conv_channels, kernel_size=k, padding=k//2, groups=conv_channels)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        x = self.dwconv(x)
+        x = x.permute(0,2,3,1)
+        shortcut = x # [B, H, W, C]
+        x = self.norm(x)
+        g, i, c = torch.split(self.fc1(x), self.split_indices, dim=-1)
+        c = c.permute(0, 3, 1, 2) # [B, H, W, C] -> [B, C, H, W]
+        c = self.conv(c)
+        c = c.permute(0, 2, 3, 1) # [B, C, H, W] -> [B, H, W, C]
+        x = self.fc2(self.act(g) * torch.cat((i, c), dim=-1))
+        x = self.drop_path(x)
+        out= x + shortcut
+        return out.permute(0,3,1,2)
+    
 
 
 class Detect(nn.Module):
@@ -34,9 +129,8 @@ class Detect(nn.Module):
         self.no = nc + self.reg_max * 4  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
-        self.cv2 = nn.ModuleList(
-            nn.Sequential(Conv(x, c2, 3), Conv(c2, c2, 3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch)
-        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3, c3, 3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
+        self.cv2 = nn.ModuleList(nn.Sequential(Conv(x, c2, 3), Conv(c2,c2,3), nn.Conv2d(c2, 4 * self.reg_max, 1)) for x in ch)
+        self.cv3 = nn.ModuleList(nn.Sequential(Conv(x, c3, 3), Conv(c3,c3,3), nn.Conv2d(c3, self.nc, 1)) for x in ch)
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
     def forward(self, x):
@@ -92,7 +186,7 @@ class Segment(Detect):
         self.detect = Detect.forward
 
         c4 = max(ch[0] // 4, self.nm)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3),Conv(c4,c4,3), nn.Conv2d(c4, self.nm, 1)) for x in ch)
 
     def forward(self, x):
         """Return model outputs and mask coefficients if training, otherwise return outputs and mask coefficients."""
@@ -117,7 +211,7 @@ class Pose(Detect):
         self.detect = Detect.forward
 
         c4 = max(ch[0] // 4, self.nk)
-        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4, c4, 3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
+        self.cv4 = nn.ModuleList(nn.Sequential(Conv(x, c4, 3), Conv(c4,c4,3), nn.Conv2d(c4, self.nk, 1)) for x in ch)
 
     def forward(self, x):
         """Perform forward pass through YOLO model and return predictions."""
@@ -152,7 +246,8 @@ class Pose(Detect):
             y[:, 1::ndim] = (y[:, 1::ndim] * 2.0 + (anchors[1] - 0.5)) * strides
             return y
 
-
+    
+import numpy as np
 class MultiTask(Detect):
 
     # def __init__(self, nc=80, kpt_shape=(17, 3), nm=32, npr=256, ch=()):
@@ -166,17 +261,45 @@ class MultiTask(Detect):
         self.detect = Detect.forward
         self.pose_head = Pose(nc, kpt_shape, ch)
         self.segment_head = Segment(nc, nm, npr, ch)
-
+        self.earb_64 = EnhancedAttentionResidualBlock(64,64)
+        self.earb_128 = EnhancedAttentionResidualBlock(128,128)
+        self.earb_256 = EnhancedAttentionResidualBlock(256,256)
+        self.earb_512 = EnhancedAttentionResidualBlock(512,512)
+        # self.att_layer_64 = Attention(64)
+        # self.att_layer_128 = Attention(128)
+        # self.att_layer_256 = Attention(256)
+        # self.att_layer_512 = Attention(512)
+    def apply_earb(self, x):
+        if x.shape[1]==64:
+            return self.earb_64(x)
+        elif x.shape[1]==128:
+            return self.earb_128(x)
+        elif x.shape[1]==256:
+            return self.earb_256(x)
+        elif x.shape[1]==512:
+            return self.earb_512(x)
+        else:
+            return ValueError("Invalid input shape")
     def forward(self, x):
         """Perform forward pass through YOLO model and return predictions."""
         bs = x[0].shape[0]  # batch size
-
-        protos = self.segment_head.proto(x[0])  # mask protos
-        mc = torch.cat([self.segment_head.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)],
-                       2)  # mask coefficients
-        kpt = torch.cat([self.pose_head.cv4[i](x[i]).view(bs, self.pose_head.nk, -1) for i in range(self.pose_head.nl)],
-                        -1)  # (bs, 17*3, h*w)
-        x = self.detect(self, x)
+        device = x[0].device
+        # Using the attention mechanism between the head and the neck part
+        # att_dict = {64:self.att_layer_64, 128:self.att_layer_128, 256:self.att_layer_256, 512:self.att_layer_512}
+        # for i in range(len(x)):
+        #     att_layer = att_dict[x[i].shape[1]]
+        #     att_layer = att_layer.to(x[i].device) 
+        #     x[i] = torch.stack([att_layer(img.permute(2, 1, 0)).permute(2, 1, 0) for img in x[i]])
+        x = [self.apply_earb(x[0]), self.apply_earb(x[1]), self.apply_earb(x[2])]
+        with torch.amp.autocast(dtype=torch.float16, device_type='cuda'):
+            protos = self.segment_head.proto(x[0])
+            
+            mc = torch.cat([self.segment_head.cv4[i](x[i]).view(bs, self.nm, -1) for i in range(self.nl)],
+                        2)  # mask coefficients
+            
+            kpt = torch.cat([self.pose_head.cv4[i](x[i]).view(bs, self.pose_head.nk, -1) for i in range(self.pose_head.nl)],
+                            -1)  # (bs, 17*3, h*w)
+            x = self.detect(self, x)
 
         if self.training:
             return x, kpt, mc, protos

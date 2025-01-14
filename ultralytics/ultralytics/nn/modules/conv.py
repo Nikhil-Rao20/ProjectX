@@ -302,8 +302,173 @@ class InceptionNeXt_Conv(nn.Module):
         x = self.blocks(x)
         return x
 
+# --------------------------------------------------------------------------------------------------------
+# Advanced_Attention_Based_Conv_Block (Proposing)
+# --------------------------------------------------------------------------------------------------------
+    
+class _Conv(nn.Module):
+
+    class DropPath_Simple(nn.Module):
+        def __init__(self, drop_prob=None):
+            super().__init__()
+            self.drop_prob = drop_prob
+        def forward(self, x):
+            if self.drop_prob == 0. or not self.training:
+                return x
+            keep_prob = 1 - self.drop_prob
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+            random_tensor.floor_()
+            return x.div(keep_prob) * random_tensor
+        
+    class Simple_Conv(nn.Module):
+        default_act = nn.SiLU()  # default activation
+        def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+            super().__init__()
+            self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+            self.bn = nn.BatchNorm2d(c2)
+            self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        def forward(self, x):
+            return self.act(self.bn(self.conv(x)))
+        def forward_fuse(self, x):
+            return self.act(self.conv(x))
+    class BottleneckLinear(nn.Module):
+        def __init__(self, c2, expanded_dim, bottleneck_ratio=0.125):
+            super().__init__()
+            bottleneck_dim = int(c2 * bottleneck_ratio)
+            self.bottleneck = nn.Linear(c2, bottleneck_dim, bias=False)
+            self.expand = nn.Linear(bottleneck_dim, expanded_dim, bias=False)
+        
+        def forward(self, x):
+            x = self.bottleneck(x)
+            return self.expand(x)
 
 
+    def __init__(self, c1,c2,k=1, s=1, p=None, g=1, d=1, act=True, ):
+        super().__init__()
+
+        conv_ratio=1.0
+        expansion_ratio=1
+        # norm_layer=partial(nn.LayerNorm, eps=1e-6)
+        self.dwconv = Conv.Simple_Conv(c1, c2, k=k)
+        # Normalization Layer
+        # self.norm = norm_layer([c2])
+        
+        # Multi-Scale Feature Extraction
+        expanded_dim = int(c2 * expansion_ratio)
+        conv_channels = int(c2 * conv_ratio)
+
+        self.fc1 = Conv.BottleneckLinear(c2, expanded_dim*2)  # For gating and multi-scale features
+
+        # Multi-scale Convolutions
+        self.conv_3x3 = nn.Conv2d(conv_channels, conv_channels, kernel_size=3,
+                                  padding=3 // 2, groups=conv_channels)
+        self.conv_5x5 = nn.Conv2d(conv_channels, conv_channels, kernel_size=5,
+                                  padding=5 // 2, groups=conv_channels)
+
+        # Additive Attention
+        self.att_weight_fc = Conv.BottleneckLinear(expanded_dim, 1)  # Softmax for additive attention
+
+        # Final Linear Projection
+        self.fc2 = Conv.BottleneckLinear(expanded_dim, c2)
+
+        # Drop Path (Stochastic Depth)
+        self.drop_path = Conv.DropPath_Simple(0.1)
+        # self.SpatialGate = CBAM_SpatialGate()
+        # self.ChannelGate = CBAM_ChannelGate(c2, 16, ['avg', 'max'])
+        self.SpatialGate = SpatialAttention()
+        self.ChannelGate = ChannelAttention(c2)
+
+        # Activation
+        self.act = nn.GELU() if act else nn.Identity()
+
+    def forward(self, x):
+        # Input shape: [B, C, H, W]
+        # Convoluting to the output channels
+        x = self.dwconv(x)
+        # Permute to [B, H, W, C] for layer normalization
+        x = x.permute(0, 2, 3, 1)
+          # Save shortcut connection
+        # x = self.norm(x)
+
+        # Gating and Multi-Scale Features
+
+        # Split the input tensor into two halves dynamically
+        fc1_out = self.fc1(x)  # Shape: [B, H, W, C]
+        split_size = fc1_out.size(-1) // 2  # Dynamically calculate split size
+        g, features = torch.split(fc1_out, [split_size, fc1_out.size(-1) - split_size], dim=-1)
+        
+        # Process multi-scale features (Split into channels for depthwise convolution)
+        shortcut = features
+        features = features.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        features_3x3 = self.conv_3x3(features)
+        features_5x5 = self.conv_5x5(features)
+
+        # Combine multi-scale features
+        combined_features = features+features_3x3 + features_5x5
+
+        combined_features = self.ChannelGate(combined_features)
+        combined_features = self.SpatialGate(combined_features)
+        # Permute back to [B, H, W, C]
+        combined_features = combined_features.permute(0, 2, 3, 1)
+
+        # Additive Attention
+        
+        result = self.att_weight_fc(features.permute(0,2,3,1))
+        attention_weights = torch.softmax(result, dim=-1)
+        gated_output = self.act(g) * attention_weights
+        # Combine features  
+        x = self.fc2(gated_output + combined_features)
+        # Drop path and residual connection
+        x = self.drop_path(x) + shortcut
+        return x.permute(0, 3, 1, 2)
+
+# --------------------------------------------------------------------------------------------------------
+# Enhanced Attention Residual Block - Used between the neck and head for better feature importance
+# --------------------------------------------------------------------------------------------------------
+
+class EnhancedAttentionResidualBlock(nn.Module):
+    class CBAM(nn.Module):
+        def __init__(self, channels, reduction=16, kernel_size=7):
+            super().__init__()
+            self.channel_att = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Conv2d(channels, channels // reduction, kernel_size=1, bias=False),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(channels // reduction, channels, kernel_size=1, bias=False),
+                nn.Sigmoid()
+            )
+            self.spatial_att = nn.Sequential(nn.Conv2d(2, 1, kernel_size=kernel_size, padding=kernel_size // 2, bias=False),nn.Sigmoid())
+        
+        def forward(self, x):
+            avg_out = self.channel_att(x)
+            x = x * avg_out
+            max_out, _ = torch.max(x, dim=1, keepdim=True)
+            avg_out = torch.mean(x, dim=1, keepdim=True)
+            spatial_out = self.spatial_att(torch.cat([max_out, avg_out], dim=1))
+            return x * spatial_out
+    def __init__(self, in_channels, out_channels, reduction=16, kernel_size=7, dilation=1):
+        super(EnhancedAttentionResidualBlock, self).__init__()
+        self.depthwise_sep_conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=dilation, dilation=dilation, groups=in_channels, bias=False),
+            # nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.cbam = EnhancedAttentionResidualBlock.CBAM(out_channels, reduction, kernel_size)
+        self.residual_connection = (
+            nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+            if in_channels != out_channels else nn.Identity()
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        residual = self.residual_connection(x)
+        x = self.depthwise_sep_conv(x)
+        x = self.cbam(x)
+        x += residual
+        return self.relu(x)
+    
 # --------------------------------------------------------------------------------------------------------
 # End
 # --------------------------------------------------------------------------------------------------------
