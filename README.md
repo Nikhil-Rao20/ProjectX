@@ -66,6 +66,41 @@ In multi-task learning, (...continue writing the abstract)
 
 * The trained mtYOLOv8 with ECA models for MS-COCO Person Multi-Task and CattleEyeView can be found in `./model_checkpoint`.
 
+#### Conv Block Modifications
+To change the Base Convolution Block you can change the name of them to "Conv". Here is a complete list of them.
+Go to ProjectX/ultralytics/ultralytics/nn/modules/conv.py
+
+1) Vanilla Block : In line 33, rename the class to "Conv"
+2) CBAM Block : In line 140, rename the "CBAM_Conv" to "Conv"
+3) ConvNeXt Block : In line 201, rename the "ConvNeXt_Conv" to "Conv"
+4) InceptionNeXt Block: In line 263, rename the "InceptionNeXt_Conv" to "Conv"
+5) Proposed Block : In line 309, rename the "AdvancedAttentionBasedConvBlock" to "Conv"
+**Note : Make sure that while changing the class name to Conv, rename the existing Conv block to their respective name or _Conv. There should be only one Conv class in the file.**
+
+#### Loss Function
+We have proposed an gradients based alligned dynamic weighting for the loss. Go to ProjectX/ultralytics/ultralytics/utils/loss.py, at line 802
+
+1) To use the vanilla loss function :
+
+```
+self.useBalancer = False
+```
+
+2) To use the vanilla loss function :
+
+```
+self.useBalancer = True
+```
+
+#### EnhancedAttentionResidualBlock : Neck to Head Features enhancement
+
+So we have proposed an another block where we could focus upon very important features for the three outputs from the neck bypassing it through our enhanced attention residual block. 
+To use this block you need to go ultralytics/ultralytics/nn/modules/head.py,
+
+1) Vanilla Passing : Comment the lines : 264,265,266,267,293
+
+3) EARB Passing : Un-comment the lines : 264,265,266,267,293
+
 ## Acknowledgments
 We would like to express our gratitude to 
 * [ultralytics](https://github.com/ultralytics/ultralytics) for the YOLOv8 codes
